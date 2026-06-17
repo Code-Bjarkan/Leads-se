@@ -25,13 +25,57 @@ SUGGEST_ONLY = False
 SALES_SWE_GROUP_ID = "S0B3EP26P4L"  # @sales-swe
 CS_SWE_GROUP_ID    = "S09LZN0TMLL"  # @cs_swe
 
-# Email domain → kommun fallback
+# Email domain → kommun fallback (exact matches)
 EMAIL_DOMAIN_KOMMUN = {
     "skola.botkyrka.se":  "Botkyrka",
     "edu.linkoping.se":   "Linköping",
     "edu.avesta.se":      "Avesta",
     "edu.vilhelmina.se":  "Vilhelmina",
     "karlstad.edu.se":    "Karlstad",
+    # Plain kommunnamn.se domains
+    "varberg.se":         "Varberg",
+    "stockholm.se":       "Stockholm",
+    "goteborg.se":        "Göteborg",
+    "malmo.se":           "Malmö",
+    "uppsala.se":         "Uppsala",
+    "vasteras.se":        "Västerås",
+    "orebro.se":          "Örebro",
+    "linkoping.se":       "Linköping",
+    "helsingborg.se":     "Helsingborg",
+    "jonkoping.se":       "Jönköping",
+    "norrkoping.se":      "Norrköping",
+    "umea.se":            "Umeå",
+    "lund.se":            "Lund",
+    "boras.se":           "Borås",
+    "gavle.se":           "Gävle",
+    "sundsvall.se":       "Sundsvall",
+    "eskilstuna.se":      "Eskilstuna",
+    "sodertalje.se":      "Södertälje",
+    "karlstad.se":        "Karlstad",
+    "vastmanland.se":     "Västerås",
+    "huddinge.se":        "Huddinge",
+    "nacka.se":           "Nacka",
+    "sollentuna.se":      "Sollentuna",
+    "haninge.se":         "Haninge",
+    "tyreso.se":          "Tyresö",
+    "jarfalla.se":        "Järfälla",
+    "botkyrka.se":        "Botkyrka",
+    "danderyd.se":        "Danderyd",
+    "lidingo.se":         "Lidingö",
+    "vaxholm.se":         "Vaxholm",
+    "osteraker.se":       "Österåker",
+    "vallentuna.se":      "Vallentuna",
+    "sigtuna.se":         "Sigtuna",
+    "upplands-vasby.se":  "Upplands Väsby",
+    "upplandsbro.se":     "Upplands-Bro",
+    "enkoping.se":        "Enköping",
+    "halmstad.se":        "Halmstad",
+    "vaxjo.se":           "Växjö",
+    "kalmar.se":          "Kalmar",
+    "kristianstad.se":    "Kristianstad",
+    "ostersund.se":       "Östersund",
+    "lulea.se":           "Luleå",
+    "gavleborg.se":       "Gävle",
 }
 
 LAST_SEEN_FILE = os.path.join(os.path.dirname(__file__), "last_seen.txt")
@@ -279,9 +323,53 @@ def parse_foat(lines):
     }
 
 
-def email_to_kommun(email):
+# Labels that are never a kommunname — skip when extracting candidates dynamically
+_GENERIC_LABELS = {
+    "edu", "skola", "skolor", "utbildning", "mail", "smtp", "mx",
+    "kommune", "kommun", "stad", "region", "landsting",
+    "www", "e", "m", "k12",
+}
+
+
+def email_domain_candidates(email):
+    """Return ordered list of search terms to try against HubSpot from the email domain.
+
+    Strategy:
+    1. Static table entry (handles diacritics / unusual structure).
+    2. Dynamic: strip TLD, filter out generic labels, capitalize each remaining
+       label as a HubSpot search candidate. Works for any TLD.
+
+    Examples:
+      lena@varberg.se          → ["Varberg"]
+      per@skola.varberg.se     → ["Varberg"]
+      x@malmo.kommune.no       → ["Malmo"]   (→ HubSpot finds Malmö)
+      x@edu.linkoping.se       → ["Linköping", "Linkoping"]  (static first)
+      x@halmstad.se            → ["Halmstad"]
+    """
     domain = email.split("@", 1)[1].lower() if "@" in email else ""
-    return EMAIL_DOMAIN_KOMMUN.get(domain, "")
+    if not domain:
+        return []
+    candidates = []
+    static = EMAIL_DOMAIN_KOMMUN.get(domain)
+    if static:
+        candidates.append(static)
+    # Dynamic: all labels except TLD, minus generic words
+    parts = domain.split(".")
+    seen = {c.lower() for c in candidates}
+    for label in parts[:-1]:  # drop TLD
+        if label in _GENERIC_LABELS:
+            continue
+        dynamic = label.capitalize()
+        if dynamic.lower() not in seen:
+            candidates.append(dynamic)
+            seen.add(dynamic.lower())
+    return candidates
+
+
+# Keep for backward compat with any callers
+def email_to_kommun(email):
+    cands = email_domain_candidates(email)
+    return cands[0] if cands else ""
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +377,20 @@ def email_to_kommun(email):
 # ---------------------------------------------------------------------------
 
 def build_reply(parsed, owners, slack_by_email, slack_by_name, slack_by_prefix):
+    lead_email = parsed.get("email", "")
+
     if parsed["type"] == "demo":
         kommun = parsed.get("kommun", "").strip()
         if not kommun:
-            kommun = email_to_kommun(parsed.get("email", ""))
+            candidates = email_domain_candidates(lead_email)
+            if candidates:
+                domain = lead_email.split("@")[-1] if "@" in lead_email else ""
+                print(f"  [fallback] Kommun empty → email domain '{domain}' → trying {candidates}")
+                kommun = candidates[0]  # best candidate; the no-match branch will try the rest
         if not kommun:
             return f"Ingen kommun angiven — taggat {sales_swe_mention(SUGGEST_ONLY)}."
-        search_term   = clean_search_term(kommun)
-        source_label  = f"kommun: {kommun}"
+        search_term  = clean_search_term(kommun)
+        source_label = f"kommun: {kommun}"
 
     else:  # foat
         municipality = parsed.get("municipality", "").strip()
@@ -313,9 +407,28 @@ def build_reply(parsed, owners, slack_by_email, slack_by_name, slack_by_prefix):
     email, name, company = lookup_person(search_term, owners)
 
     if not email:
-        if parsed["type"] == "foat":
-            return f"Ingen matchning för {source_label} — taggat {cs_sweden_mention(SUGGEST_ONLY)}."
-        return f"Ingen matchning för {source_label} — taggat {sales_swe_mention(SUGGEST_ONLY)}."
+        # Kommun was present but didn't match HubSpot — try email-domain fallback
+        if parsed["type"] == "demo":
+            domain = lead_email.split("@")[-1] if "@" in lead_email else ""
+            candidates = [c for c in email_domain_candidates(lead_email)
+                          if c.lower() != search_term.lower()]
+            if candidates:
+                for candidate in candidates:
+                    print(f"  [fallback] Tried {source_label} → no match → "
+                          f"email domain '{domain}' → trying '{candidate}'")
+                    fb_email, fb_name, fb_company = lookup_person(clean_search_term(candidate), owners)
+                    if fb_email:
+                        uid = slack_lookup_user(fb_email, fb_name, slack_by_email, slack_by_name, slack_by_prefix)
+                        tag = mention(uid, fb_name, fb_email, SUGGEST_ONLY)
+                        label = "Föreslagen ägare" if SUGGEST_ONLY else "Ägare"
+                        print(f"  [fallback] Matched '{fb_company}' via email domain fallback")
+                        return f"{label}: {tag} (HubSpot: {fb_company}) [matchad via e-postdomän {domain}]"
+                    print(f"  [fallback] '{candidate}' → no HubSpot match")
+            elif domain:
+                print(f"  [fallback] Tried {source_label} → no match → "
+                      f"could not extract kandidat from '{domain}'")
+            return f"Ingen matchning för {source_label} — taggat {sales_swe_mention(SUGGEST_ONLY)}."
+        return f"Ingen matchning för {source_label} — taggat {cs_sweden_mention(SUGGEST_ONLY)}."
 
     uid   = slack_lookup_user(email, name, slack_by_email, slack_by_name, slack_by_prefix)
     tag   = mention(uid, name, email, SUGGEST_ONLY)
