@@ -106,14 +106,9 @@ def hs_search_company(name):
     )
     r.raise_for_status()
     results = r.json()["results"]
-    # Sort: Swedish companies first, unknown second, non-Swedish last
+    # Swedish companies are named "SWE - <NAME>" — sort those first
     def swedish_rank(c):
-        country = (c["properties"].get("country") or "").lower()
-        if not country:
-            return 1
-        if "swed" in country or country == "se":
-            return 0
-        return 2
+        return 0 if (c["properties"].get("name") or "").upper().startswith("SWE -") else 1
     return sorted(results, key=swedish_rank)
 
 
