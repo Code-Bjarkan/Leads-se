@@ -96,8 +96,8 @@ def hs_get_owners():
 def hs_search_company(name):
     body = {
         "filterGroups": [{"filters": [{"propertyName": "name", "operator": "CONTAINS_TOKEN", "value": name}]}],
-        "properties": ["name", "csm", "hubspot_owner_id", "lifecyclestage"],
-        "limit": 5,
+        "properties": ["name", "csm", "hubspot_owner_id", "lifecyclestage", "country"],
+        "limit": 10,
     }
     r = requests.post(
         "https://api.hubapi.com/crm/v3/objects/companies/search",
@@ -105,7 +105,16 @@ def hs_search_company(name):
         json=body,
     )
     r.raise_for_status()
-    return r.json()["results"]
+    results = r.json()["results"]
+    # Sort: Swedish companies first, unknown second, non-Swedish last
+    def swedish_rank(c):
+        country = (c["properties"].get("country") or "").lower()
+        if not country:
+            return 1
+        if "swed" in country or country == "se":
+            return 0
+        return 2
+    return sorted(results, key=swedish_rank)
 
 
 def resolve_owner(owner_id, owners):
