@@ -1,6 +1,8 @@
+import http.server
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 import requests
@@ -80,6 +82,23 @@ EMAIL_DOMAIN_KOMMUN = {
 
 LAST_SEEN_FILE = os.path.join(os.path.dirname(__file__), "last_seen.txt")
 
+# (connect, read) seconds. requests has no default timeout — without this a
+# stalled Slack/HubSpot connection blocks the poll loop forever.
+HTTP_TIMEOUT = (5, 20)
+
+POLL_INTERVAL = 60
+
+# Health endpoint reports unhealthy once a poll hasn't SUCCEEDED for this long.
+# Reporting only — never kills the process, because a Slack/HubSpot outage is
+# not something a restart fixes.
+HEALTH_MAX_STALE = int(os.environ.get("HEALTH_MAX_STALE_SECONDS", "300"))
+
+# The watchdog exits the process once the loop hasn't TICKED for this long,
+# i.e. it is genuinely wedged rather than merely failing. Railway's restart
+# policy then brings it back. Generous on purpose: exits consume the platform's
+# limited restart budget, so only a real hang should trigger one.
+WATCHDOG_MAX_STALE = int(os.environ.get("WATCHDOG_MAX_STALE_SECONDS", "900"))
+
 # ---------------------------------------------------------------------------
 # HubSpot helpers
 # ---------------------------------------------------------------------------
@@ -88,7 +107,8 @@ HS_HEADERS = {"Authorization": f"Bearer {HUBSPOT_TOKEN}"}
 
 
 def hs_get_owners():
-    r = requests.get("https://api.hubapi.com/crm/v3/owners?limit=200", headers=HS_HEADERS)
+    r = requests.get("https://api.hubapi.com/crm/v3/owners?limit=200", headers=HS_HEADERS,
+                     timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return {o["id"]: o for o in r.json()["results"]}
 
@@ -103,6 +123,7 @@ def hs_search_company(name):
         "https://api.hubapi.com/crm/v3/objects/companies/search",
         headers=HS_HEADERS,
         json=body,
+        timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     results = r.json()["results"]
@@ -163,6 +184,7 @@ def slack_get_messages(channel, oldest):
         "https://slack.com/api/conversations.history",
         headers=SL_HEADERS,
         params={"channel": channel, "oldest": oldest, "limit": 50},
+        timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     data = r.json()
@@ -174,7 +196,7 @@ def slack_get_messages(channel, oldest):
 def slack_get_bot_id():
     if not SLACK_BOT_TOKEN:
         return None
-    r = requests.get("https://slack.com/api/auth.test", headers=SL_HEADERS)
+    r = requests.get("https://slack.com/api/auth.test", headers=SL_HEADERS, timeout=HTTP_TIMEOUT)
     return r.json().get("bot_id")
 
 
@@ -185,6 +207,7 @@ def slack_already_replied(channel, thread_ts, router_bot_id):
         "https://slack.com/api/conversations.replies",
         headers=SL_HEADERS,
         params={"channel": channel, "ts": thread_ts, "limit": 20},
+        timeout=HTTP_TIMEOUT,
     )
     if not r.ok or not r.json().get("ok"):
         return False
@@ -202,6 +225,7 @@ def slack_post_reply(channel, thread_ts, text):
         "https://slack.com/api/chat.postMessage",
         headers=SL_HEADERS,
         json={"channel": channel, "thread_ts": thread_ts, "text": text},
+        timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     data = r.json()
@@ -223,6 +247,7 @@ def slack_load_users():
         "https://slack.com/api/users.list",
         headers=SL_HEADERS,
         params={"limit": 500},
+        timeout=HTTP_TIMEOUT,
     )
     by_email, by_name, by_prefix = {}, {}, {}
     for u in r.json().get("members", []):
@@ -441,6 +466,87 @@ def build_reply(parsed, owners, slack_by_email, slack_by_name, slack_by_prefix):
 
 
 # ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
+
+# Two clocks, deliberately separate:
+#   _last_tick — the loop went round at all. Stale means wedged (a hang no
+#                exception handler can catch). Only this one triggers a restart.
+#   _last_ok   — the poll actually succeeded. Stale means Slack/HubSpot is
+#                unhappy. Worth reporting, but restarting wouldn't fix it and
+#                would burn the platform's capped restart budget.
+_last_tick = time.time()
+_last_ok = time.time()
+
+
+def mark_tick():
+    global _last_tick
+    _last_tick = time.time()
+
+
+def mark_healthy():
+    global _last_ok
+    _last_ok = time.time()
+
+
+class _HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        now = time.time()
+        ok_age, tick_age = int(now - _last_ok), int(now - _last_tick)
+        healthy = ok_age < HEALTH_MAX_STALE
+        body = (f"{'ok' if healthy else 'stale'} "
+                f"last_success={ok_age}s ago last_tick={tick_age}s ago\n").encode()
+        self.send_response(200 if healthy else 503)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # don't spam the poll log with healthcheck hits
+
+
+def start_health_server():
+    """Serve the healthcheck in a daemon thread. Never fatal: if the port is
+    unavailable the router still routes leads, it just loses the watchdog."""
+    port = int(os.environ.get("PORT", "8080"))
+    try:
+        server = http.server.ThreadingHTTPServer(("", port), _HealthHandler)
+    except OSError as e:
+        print(f"WARNING: health server could not bind port {port}: {e} "
+              f"— continuing without healthcheck", flush=True)
+        return
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Health endpoint on :{port} (reports stale after {HEALTH_MAX_STALE}s "
+          f"without a successful poll).", flush=True)
+
+
+def start_watchdog():
+    """Exit the process if the poll loop stops ticking.
+
+    Railway's Healthcheck Path is a deploy-time gate, not a recurring liveness
+    probe, so an HTTP endpoint alone can never get a wedged worker restarted.
+    What Railway does act on is process exit, via the Restart Policy — so the
+    watchdog has to be the thing that exits. os._exit is deliberate: sys.exit
+    from a non-main thread only unwinds that thread.
+    """
+    def loop():
+        while True:
+            time.sleep(30)
+            stale = time.time() - _last_tick
+            if stale > WATCHDOG_MAX_STALE:
+                print(f"WATCHDOG: poll loop stuck for {int(stale)}s "
+                      f"(limit {WATCHDOG_MAX_STALE}s) — exiting for restart", flush=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(1)
+
+    threading.Thread(target=loop, daemon=True).start()
+    print(f"Watchdog armed (exit after {WATCHDOG_MAX_STALE}s without a loop tick).",
+          flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Poll loop
 # ---------------------------------------------------------------------------
 
@@ -496,6 +602,32 @@ def run_once(owners, slack_by_email, slack_by_name, slack_by_prefix, router_bot_
     save_last_seen(new_ts)
 
 
+def startup(retry):
+    """Load owners, Slack users and the bot ID.
+
+    In poll mode a transient HubSpot/Slack error at boot used to kill the
+    process before the loop's own error handling applied, which turns one bad
+    API response into a restart loop. Retry instead.
+    """
+    while True:
+        try:
+            owners = hs_get_owners()
+            print(f"Loaded {len(owners)} HubSpot owners.")
+
+            slack_by_email, slack_by_name, slack_by_prefix = slack_load_users()
+            print(f"Loaded {len(slack_by_email)} Slack users "
+                  f"({len(slack_by_prefix)} email prefixes).")
+
+            router_bot_id = slack_get_bot_id()
+            print(f"Router bot ID: {router_bot_id}")
+            return owners, slack_by_email, slack_by_name, slack_by_prefix, router_bot_id
+        except Exception as e:
+            if not retry:
+                raise
+            print(f"Startup failed: {e} — retrying in 30 s", flush=True)
+            time.sleep(30)
+
+
 def main():
     if not SLACK_BOT_TOKEN:
         print("WARNING: SLACK_BOT_TOKEN not set — will print replies but not post them.")
@@ -503,25 +635,31 @@ def main():
     if SUGGEST_ONLY:
         print("Running in SUGGEST-ONLY mode (no real @-mentions).")
 
-    owners = hs_get_owners()
-    print(f"Loaded {len(owners)} HubSpot owners.")
+    once = "--once" in sys.argv
 
-    slack_by_email, slack_by_name, slack_by_prefix = slack_load_users()
-    print(f"Loaded {len(slack_by_email)} Slack users ({len(slack_by_prefix)} email prefixes).")
+    # Started before startup() so a slow boot doesn't read as an unhealthy
+    # service. Pointless for --once, which has no loop to watch.
+    if not once:
+        start_health_server()
+        start_watchdog()
 
-    router_bot_id = slack_get_bot_id()
-    print(f"Router bot ID: {router_bot_id}")
+    owners, slack_by_email, slack_by_name, slack_by_prefix, router_bot_id = startup(retry=not once)
 
-    if "--once" in sys.argv:
+    if once:
         run_once(owners, slack_by_email, slack_by_name, slack_by_prefix, router_bot_id)
-    else:
-        print("Polling #leads-se every 60 s. Ctrl+C to stop.")
-        while True:
-            try:
-                run_once(owners, slack_by_email, slack_by_name, slack_by_prefix, router_bot_id)
-            except Exception as e:
-                print(f"Error: {e}")
-            time.sleep(60)
+        return
+
+    print(f"Polling #leads-se every {POLL_INTERVAL} s. Ctrl+C to stop.")
+    mark_tick()      # don't count a slow boot against the watchdog
+    mark_healthy()
+    while True:
+        try:
+            run_once(owners, slack_by_email, slack_by_name, slack_by_prefix, router_bot_id)
+            mark_healthy()
+        except Exception as e:
+            print(f"Error: {e}")
+        mark_tick()  # after the except too: a failing poll is alive, not wedged
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":

@@ -1,1 +1,1 @@
-worker: python router.py
+worker: python -u router.py
