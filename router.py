@@ -359,14 +359,28 @@ _GENERIC_LABELS = {
     "www", "e", "m", "k12",
 }
 
+# Public suffixes that span two labels. Dropping only the last one leaves the
+# other half as a search term: magmamaths.co.uk once yielded "Co", which
+# matched a Colorado school district in HubSpot and tagged the wrong owner.
+_MULTIPART_TLDS = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "sch.uk", "me.uk", "ltd.uk", "plc.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.nz", "co.za", "co.jp", "co.in", "co.kr",
+    "com.br", "com.mx", "com.tr", "com.pl", "com.cn",
+}
+
+# No Swedish kommun name is shorter than three characters, so anything shorter
+# is a suffix fragment rather than a place. Backstop for suffixes not listed above.
+_MIN_LABEL_LEN = 3
+
 
 def email_domain_candidates(email):
     """Return ordered list of search terms to try against HubSpot from the email domain.
 
     Strategy:
     1. Static table entry (handles diacritics / unusual structure).
-    2. Dynamic: strip TLD, filter out generic labels, capitalize each remaining
-       label as a HubSpot search candidate. Works for any TLD.
+    2. Dynamic: strip the public suffix, filter out generic labels and
+       too-short fragments, capitalize what remains. Works for any TLD.
 
     Examples:
       lena@varberg.se          → ["Varberg"]
@@ -374,6 +388,7 @@ def email_domain_candidates(email):
       x@malmo.kommune.no       → ["Malmo"]   (→ HubSpot finds Malmö)
       x@edu.linkoping.se       → ["Linköping", "Linkoping"]  (static first)
       x@halmstad.se            → ["Halmstad"]
+      x@magmamaths.co.uk       → ["Magmamaths"]  (not "Co")
     """
     domain = email.split("@", 1)[1].lower() if "@" in email else ""
     if not domain:
@@ -382,11 +397,15 @@ def email_domain_candidates(email):
     static = EMAIL_DOMAIN_KOMMUN.get(domain)
     if static:
         candidates.append(static)
-    # Dynamic: all labels except TLD, minus generic words
+    # Dynamic: everything left of the public suffix, minus generic words
     parts = domain.split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in _MULTIPART_TLDS:
+        labels = parts[:-2]
+    else:
+        labels = parts[:-1]
     seen = {c.lower() for c in candidates}
-    for label in parts[:-1]:  # drop TLD
-        if label in _GENERIC_LABELS:
+    for label in labels:
+        if label in _GENERIC_LABELS or len(label) < _MIN_LABEL_LEN:
             continue
         dynamic = label.capitalize()
         if dynamic.lower() not in seen:
@@ -551,16 +570,28 @@ def start_watchdog():
 # ---------------------------------------------------------------------------
 
 def load_last_seen():
+    """Slack timestamps are compared as strings, so the stored value must keep
+    the same shape Slack sends: 10 digits, a dot, 6 decimals.
+
+    Truncating to whole seconds used to break that. '1785956216.196599' was
+    saved as '1785956216', and on the next poll the string compare in run_once
+    read the longer string as greater — so the message was never filtered out
+    and got re-checked every 60 s forever, one Slack API call each time.
+
+    A legacy truncated file self-heals: the message comes back once more, the
+    already-replied check skips it, and the full timestamp is then written.
+    """
     try:
         raw = open(LAST_SEEN_FILE, encoding="utf-8-sig").read().strip()
-        return str(int(float(raw)))
-    except FileNotFoundError:
-        return str(int(time.time() - 3600))
+        float(raw)  # validate; a corrupt file falls back to the 1 h window
+        return raw
+    except (FileNotFoundError, ValueError):
+        return f"{time.time() - 3600:.6f}"
 
 
 def save_last_seen(ts):
     with open(LAST_SEEN_FILE, "w") as f:
-        f.write(str(int(float(ts))))
+        f.write(str(ts))
 
 
 def run_once(owners, slack_by_email, slack_by_name, slack_by_prefix, router_bot_id):
