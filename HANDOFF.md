@@ -47,15 +47,22 @@ finns för att HubSpot har `@magma.se` och Slack `@magmamath.com` för samma per
 
 ## 3. Beslut och lösningar som inte syns i koden
 
-### Railway deployas via CLI, inte GitHub — detta är den viktigaste punkten
+### Deploy sker numera från GitHub — men gjorde det inte förrän 2026-09-04
 
-Hela deployment-historiken säger **"railway up … via CLI"**. Repot är **inte** kopplat till
-Railway. En `git push` deployar därför **ingenting**. Det är lätt att tro motsatsen och sitta
-och vänta på en deploy som aldrig kommer.
+Repot kopplades till Railway 2026-09-04 (**Settings → Source**, `Code-Bjarkan/Leads-se`, gren
+`main`). Sedan dess deployar en `git push` till `main` automatiskt.
 
-Och `railway`-CLI:t finns **inte installerat** på Annas maskin (verifierat 2026-09-04: inget
-`railway` i PATH, inget `npm`/`node`/`scoop`/`choco` att installera med, Railway finns inte i
-`winget`). Dashboarden är enda vägen just nu.
+Före det gick allt via `railway up` från CLI, och hela deployment-historiken fram till
+2026-09-04 säger **"via CLI"**. Går man tillbaka i historiken är det den förklaringen som gäller.
+
+Kopplingen krånglade på ett icke-uppenbart sätt: Railways GitHub-app var installerad på kontot
+**`matteappen`**, medan repot ligger under **`Code-Bjarkan`**. Repot syntes därför inte i
+Connect Repo-listan. Lösningen var **"Configure GitHub App"** överst i den dropdownen och att
+ge appen tillgång till `Code-Bjarkan`.
+
+`railway`-CLI:t finns fortfarande **inte installerat** på Annas maskin (verifierat 2026-09-04:
+inget `railway` i PATH, inget `npm`/`node`/`scoop`/`choco` att installera med, Railway finns
+inte i `winget`). För loggar och inställningar är dashboarden enda vägen.
 
 ### Railways Healthcheck Path är en deploy-grind, inte en liveness-probe
 
@@ -119,16 +126,21 @@ om man vill slippa flaggan.
 
 ## 4. Kända problem
 
-### BLOCKER: senaste commiten är inte deployad
+### Löst 2026-09-04: koden är deployad
 
-`50633f9` ("Harden router against hangs and boot-time restart loops") ligger på GitHub `main`
-men **kör inte i produktion**. Aktiv deployment är `6af68a5e` från **2026-06-18** — junikod.
+Deployment `7ef65523` (2026-09-04 16:40, från GitHub) kör `50633f9` + `ebb2509`. Bekräftat i
+deploy-loggen genom raderna `Health endpoint on :8080 …` och
+`Watchdog armed (exit after 900s without a loop tick).` — saknas de kör man äldre kod.
 
-Fixa genom att koppla repot: **Settings → Source → Connect Repo** → `Code-Bjarkan/Leads-se`,
-gren `main`. Alternativt installera Railway-CLI:t manuellt och köra `railway up`.
+Notera att loggraderna vid uppstart kan visas i **fel ordning**. Alla sex delar samma
+sekundstämpel och Railways loggindexering har ingen sub-sekundsupplösning att sortera på.
+I processen körs de sekventiellt i huvudtråden; någon verklig omkastning kan inte ske.
 
-**Verifiering att det lyckats:** den nya loggen ska innehålla raden
-`Watchdog armed (exit after 900s without a loop tick).` vid uppstart. Saknas den kör du fortfarande junikoden.
+**Ännu inte verifierat i produktion:** att last_seen-fixen tystar den minutvisa upprepningen,
+och att watchdogen aldrig löser ut i onödan. Den nya koden har vid skrivande stund kört i
+minuter, inte dygn. Junistabiliteten som nämns nedan gäller den *gamla* koden och säger
+ingenting om den nya. Kolla vid tillfälle att nästa riktiga lead får ett trådsvar, och att
+`Already replied — skipping.` inte återkommer varje minut.
 
 ### FIXAD 2026-09-04: `last_seen` trunkerades, samma meddelande behandlades om varje minut
 
@@ -187,12 +199,11 @@ Vill man täcka hela 50-dagarsperioden: sök på `Loaded` i loggfiltret — varj
 
 ## 5. Nästa steg, i ordning
 
-1. **Koppla Railway till GitHub-repot** och deploya. Inget annat spelar roll förrän detta är
-   gjort — produktion kör fortfarande junikod, och alla fixar nedan ligger odeployade.
-2. Verifiera i den nya loggen: raden `Watchdog armed (exit after 900s…)` ska finnas, och
-   `Already replied — skipping.` ska **sluta** upprepas varje minut.
-3. Valfritt: höj restart-taket 10 → 20 i Settings → Deploy.
-4. Valfritt: committa `PROJECT.md`, `smoke_test.py`, `run_router.bat` — de är otrackade men
+1. **Bekräfta att fixarna håller i drift.** Sök `Already replied` i deploy-loggen — den ska
+   inte upprepas varje minut längre. Och se att nästa riktiga lead får ett trådsvar.
+   Detta är det enda som återstår från sessionen 2026-09-04.
+2. Valfritt: höj restart-taket 10 → 20 i Settings → Deploy.
+3. Valfritt: committa `PROJECT.md`, `smoke_test.py`, `run_router.bat` — de är otrackade men
    hör hemma i repot. `router.log`, `router_err.log`, `last_seen.txt` och `debug_*.py` bör
    däremot inte in.
 
